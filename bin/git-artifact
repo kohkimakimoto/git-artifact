@@ -1,0 +1,1284 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Manage development artifacts on a separate Git branch."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import difflib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+
+VERSION = "0.1.0"
+
+DEFAULT_BRANCH = "artifacts"
+DEFAULT_WORKSPACE = ".artifacts"
+ARTIFACT_META = ".artifact.json"
+README_NAME = "README.md"
+DEFAULT_SKILL_PATH = ".agents/skills/git-artifact/SKILL.md"
+
+ARTIFACT_README = """# Artifacts branch
+
+This branch is managed by [git-artifact](https://github.com/kohkimakimoto/git-artifact).
+It is an orphan branch used only to store development artifacts (notes, plans, benchmarks, and related files).
+
+Do not put application source code here. Use `git artifact` to read and update this branch; editing its contents by hand can break artifact metadata.
+"""
+
+SKILL_CONTENT = """---
+name: git-artifact
+description: Save and load development artifacts with git-artifact on a dedicated orphan branch. Use when a project uses git-artifact or the user asks to manage notes, plans, designs, or related files with git artifact.
+---
+
+# git-artifact
+
+Use `git artifact` to keep development artifacts off source-code branches. Python 3.11+ and Git are required. Options follow the operation: `git artifact <command> -h`.
+
+Official repository: https://github.com/kohkimakimoto/git-artifact
+
+Use its [README](https://github.com/kohkimakimoto/git-artifact#readme) for documentation and [source code](https://github.com/kohkimakimoto/git-artifact/blob/main/bin/git-artifact) when behavior needs clarification.
+
+## Check availability
+
+```sh
+git artifact version
+```
+
+If git-artifact is missing from PATH, consult the official installation instructions, research options for the user's environment, and propose commands. Install only when that is within the user's requested scope; otherwise wait. After install or repair, confirm `git artifact version` before continuing.
+
+## Core concepts
+
+- An Artifact is a named directory of related files plus tool-managed `.artifact.json` (description, created_at, updated_at).
+- Storage is a shared orphan branch (default `artifacts`), kept separate from source branches.
+- Local workspace is `.artifacts/` at the current Git worktree root. Expand only the Artifacts you need.
+- `.artifact.json` stays on the storage branch. `load` / `new` do not place it in the workspace; do not edit it by hand.
+- `.artifact.json` is reserved: `save` and `diff` reject local entries with that name anywhere inside an Artifact.
+- Create local Artifact directories with `new` or `load`.
+
+## Discover Artifacts
+
+```sh
+git artifact list
+git artifact list --filter auth --sort updated_at --order desc
+git artifact list --json
+```
+
+`--filter` is a case-sensitive substring match against Name or Description. Prefer `list` before reading File contents.
+
+## Create, edit, save
+
+```sh
+git artifact new auth-redesign -d "Auth redesign notes"
+# edit files under .artifacts/auth-redesign/
+git artifact diff auth-redesign
+git artifact save auth-redesign
+```
+
+- `new` creates storage metadata and an empty local directory. An existing Name is an error.
+- `save` updates an existing Artifact: it replaces that Artifact on the branch tip with the local files. After syncing others' updates, use `load -f` before editing if you need their content.
+- `save -a` saves every Artifact present in the local workspace.
+- Description: set at `new -d`, later with `describe NAME TEXT`, clear with `describe NAME --clear`. `save` does not change description.
+- Confirm local changes with `diff`. Exit status 1 means differences or a runtime error; usage errors are 2.
+
+## Load and delete
+
+```sh
+git artifact load auth-redesign
+git artifact load -f auth-redesign
+git artifact load -a
+git artifact delete old-spike
+rm -rf .artifacts/old-spike
+```
+
+- `load` expands Files into `.artifacts/NAME/` without `.artifact.json`. Existing local directories require `-f`.
+- `delete` removes the Artifact from the storage branch tip and does not touch the local workspace.
+- Removing a local directory does not delete storage. Deleting storage does not remove local files.
+
+## Branches and remotes
+
+Default local branch is `artifacts`. Publish and sync with ordinary Git. First publish: `git push origin artifacts`. Later:
+
+```sh
+git fetch origin
+git switch artifacts
+git rebase origin/artifacts
+git push origin artifacts
+git switch -
+```
+
+Use `-b` / `-n` / `-B` when writing to a working branch (for example for a pull request):
+
+```sh
+git artifact save -b artifacts-update-auth -n -B origin/artifacts auth-redesign
+```
+
+A branch checked out in any worktree cannot be updated.
+
+## Agent principles
+
+1. Prefer current source code over saved Artifacts as specifications.
+2. Discover with `list` / `--filter` first.
+3. Create with `new`; edit existing with `load`.
+4. Edit Artifact Files as normal files; save with explicit `save <NAME>`.
+5. `save` replaces the tip Artifact with local files; after sync, use `load -f` when you need the remote content.
+6. Set description with `new -d` / `describe`; do not edit `.artifact.json` by hand.
+7. Use `diff` before discarding local work.
+8. Storage delete is `delete`; local cleanup is ordinary `rm -rf`.
+"""
+
+
+class ArtifactError(Exception):
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.code = code
+
+
+def run(command: list[str], data: bytes | None = None, cwd: Path | None = None, check: bool = True):
+    result = subprocess.run(
+        command, input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd, check=False,
+    )
+    if check and result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip()
+        raise ArtifactError(detail or f"{command[0]} failed (exit {result.returncode}).")
+    return result
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_utc(value: str) -> datetime:
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+        raise ArtifactError(f"Invalid timestamp in {ARTIFACT_META}: {value!r}")
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ArtifactError(f"Invalid timestamp in {ARTIFACT_META}: {value!r}") from error
+
+
+def format_local(dt: datetime) -> str:
+    local = dt.astimezone()
+    return local.strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def valid_artifact_name(name: str) -> str:
+    if not isinstance(name, str):
+        raise ArtifactError(f"Invalid Artifact name: {name!r}", 2)
+    try:
+        name.encode("utf-8")
+    except UnicodeError as error:
+        raise ArtifactError("Artifact names must be valid UTF-8.", 2) from error
+    if (
+        not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or any(ord(c) < 32 or ord(c) == 127 for c in name)
+        or name == README_NAME
+        or name == ARTIFACT_META
+        or name.lower() == ".git"
+    ):
+        raise ArtifactError(f"Invalid Artifact name: {name!r}", 2)
+    return name
+
+
+def valid_relpath(name: str) -> str:
+    try:
+        name.encode("utf-8")
+    except UnicodeError as error:
+        raise ArtifactError("Paths must be valid UTF-8.") from error
+    parts = name.split("/")
+    if (
+        not name
+        or any(p in ("", ".", "..") or p.lower() == ".git" for p in parts)
+        or "\\" in name
+        or any(ord(c) < 32 or ord(c) == 127 for c in name)
+    ):
+        raise ArtifactError(f"Unsupported file path: {name!r}")
+    return name
+
+
+def dump_meta(description: str, created_at: str, updated_at: str) -> bytes:
+    parse_utc(created_at)
+    parse_utc(updated_at)
+    if not isinstance(description, str):
+        raise ArtifactError(f"{ARTIFACT_META} description must be a string.")
+    payload = {
+        "description": description,
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+    return (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def parse_meta(data: bytes, *, context: str) -> dict[str, str]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeError as error:
+        raise ArtifactError(f"{ARTIFACT_META} must be UTF-8 ({context}).") from error
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ArtifactError(f"Invalid JSON in {ARTIFACT_META} ({context}).") from error
+    if not isinstance(value, dict):
+        raise ArtifactError(f"{ARTIFACT_META} must be a JSON object ({context}).")
+    description = value.get("description", "")
+    if description is None:
+        description = ""
+    if not isinstance(description, str):
+        raise ArtifactError(f"{ARTIFACT_META} description must be a string ({context}).")
+    for field in ("created_at", "updated_at"):
+        if field not in value:
+            raise ArtifactError(f"{ARTIFACT_META} missing {field} ({context}).")
+        if not isinstance(value[field], str):
+            raise ArtifactError(f"{ARTIFACT_META} {field} must be a string ({context}).")
+        parse_utc(value[field])
+    return {
+        "description": description,
+        "created_at": value["created_at"],
+        "updated_at": value["updated_at"],
+    }
+
+
+def file_mode(path: Path) -> str:
+    mode = path.stat().st_mode
+    return "100755" if mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH) else "100644"
+
+
+def output_skill(args: argparse.Namespace) -> None:
+    if args.output is None:
+        if args.force:
+            raise ArtifactError("--force requires --output.", 2)
+        sys.stdout.write(SKILL_CONTENT)
+        return
+    path = Path(args.output).expanduser()
+    if path.is_symlink():
+        raise ArtifactError(f"Refusing to overwrite a symlink: {path}")
+    if path.exists() and not args.force:
+        raise ArtifactError(f"File already exists: {path}. Use -f to overwrite it.")
+    if path.exists() and not path.is_file():
+        raise ArtifactError(f"Not a regular file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".git-artifact-skill-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(SKILL_CONTENT)
+        if args.force:
+            os.replace(temporary, path)
+        else:
+            os.link(temporary, path)
+            Path(temporary).unlink(missing_ok=True)
+            temporary = ""
+        print(f"Wrote skill: {path}", file=sys.stderr)
+    finally:
+        if temporary:
+            Path(temporary).unlink(missing_ok=True)
+
+
+@dataclass
+class ArtifactInfo:
+    name: str
+    description: str
+    created_at: str
+    updated_at: str
+    tree_oid: str
+    meta_oid: str
+
+
+class Repository:
+    def __init__(self) -> None:
+        self.cwd = Path.cwd().resolve()
+        root = run(["git", "rev-parse", "--show-toplevel"], check=False)
+        if root.returncode:
+            raise ArtifactError("Run git-artifact inside a Git working tree.")
+        self.root = Path(os.fsdecode(root.stdout.rstrip(b"\n"))).resolve()
+        self.git_dirs: list[Path] = []
+        for flag in ("--absolute-git-dir", "--git-common-dir"):
+            value = self.git("rev-parse", flag).stdout.rstrip(b"\n")
+            self.git_dirs.append((self.root / os.fsdecode(value)).resolve())
+        self.common_dir = self.git_dirs[1]
+        self.workspace = self.root / DEFAULT_WORKSPACE
+
+    def git(self, *args: str, data: bytes | None = None, check: bool = True):
+        return run(["git", *args], data=data, cwd=self.root, check=check)
+
+    def blob(self, oid: str) -> bytes:
+        return self.git("cat-file", "blob", oid).stdout
+
+    def hash_blob(self, content: bytes) -> str:
+        return self.git("hash-object", "-w", "--stdin", data=content).stdout.decode().strip()
+
+    def branch_ref(self, name: str) -> str:
+        if (
+            name.startswith("-")
+            or "@{" in name
+            or self.git("check-ref-format", "--branch", name, check=False).returncode
+        ):
+            raise ArtifactError(f"Invalid branch name: {name}", 2)
+        ref = "refs/heads/" + name
+        if self.git("symbolic-ref", "-q", ref, check=False).returncode == 0:
+            raise ArtifactError(f"Symbolic branch refs are not supported: {name}")
+        return ref
+
+    def branch_oid(self, ref: str) -> str | None:
+        result = self.git("show-ref", "--verify", "--hash", ref, check=False)
+        if result.returncode:
+            return None
+        return result.stdout.decode().strip()
+
+    def commit_oid(self, revision: str) -> str:
+        result = self.git(
+            "rev-parse", "--verify", "--end-of-options", revision + "^{commit}", check=False,
+        )
+        if result.returncode:
+            raise ArtifactError(f"Cannot resolve commit: {revision}")
+        return result.stdout.decode().strip()
+
+    def ensure_not_checked_out(self, ref: str) -> None:
+        worktrees = self.git("worktree", "list", "--porcelain").stdout.splitlines()
+        if ("branch " + ref).encode() in worktrees:
+            raise ArtifactError(f"Target branch is checked out in a worktree: {ref}")
+
+    def ensure_workspace_excluded(self) -> None:
+        info_dir = self.common_dir / "info"
+        info_dir.mkdir(parents=True, exist_ok=True)
+        exclude = info_dir / "exclude"
+        marker = DEFAULT_WORKSPACE + "/"
+        existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+        lines = existing.splitlines()
+        if marker in lines or DEFAULT_WORKSPACE in lines:
+            return
+        with exclude.open("a", encoding="utf-8", newline="\n") as stream:
+            if existing and not existing.endswith("\n"):
+                stream.write("\n")
+            stream.write(f"# Added by git-artifact\n{marker}\n")
+
+    def local_artifact_dir(self, name: str) -> Path:
+        valid_artifact_name(name)
+        path = self.workspace / name
+        if path.exists() and not path.is_dir():
+            raise ArtifactError(f"Not a directory: {DEFAULT_WORKSPACE}/{name}")
+        if path.is_symlink():
+            raise ArtifactError(f"Symlinks are not supported: {DEFAULT_WORKSPACE}/{name}")
+        return path
+
+    def list_local_artifacts(self) -> list[str]:
+        if not self.workspace.exists():
+            return []
+        if not self.workspace.is_dir() or self.workspace.is_symlink():
+            raise ArtifactError(f"Not a directory: {DEFAULT_WORKSPACE}")
+        names = []
+        for entry in sorted(self.workspace.iterdir(), key=lambda p: p.name):
+            if entry.is_symlink():
+                raise ArtifactError(f"Symlinks are not supported: {DEFAULT_WORKSPACE}/{entry.name}")
+            if entry.is_dir():
+                names.append(valid_artifact_name(entry.name))
+            else:
+                raise ArtifactError(f"Unexpected file in workspace: {DEFAULT_WORKSPACE}/{entry.name}")
+        return names
+
+    def ls_tree(self, treeish: str, *, recursive: bool = False) -> list[tuple[str, str, str, str]]:
+        args = ["ls-tree", "-z"]
+        if recursive:
+            args.append("-r")
+        args.append(treeish)
+        entries = []
+        for entry in filter(None, self.git(*args).stdout.split(b"\0")):
+            meta, raw_name = entry.split(b"\t", 1)
+            try:
+                name = raw_name.decode("utf-8")
+            except UnicodeError as error:
+                raise ArtifactError("Tree contains a non-UTF-8 path.") from error
+            mode, kind, oid = meta.decode("ascii").split()
+            entries.append((mode, kind, oid, name))
+        return entries
+
+    def root_entries(self, treeish: str) -> dict[str, tuple[str, str, str]]:
+        result: dict[str, tuple[str, str, str]] = {}
+        for mode, kind, oid, name in self.ls_tree(treeish):
+            if name in result:
+                raise ArtifactError(f"Duplicate tree entry: {name}")
+            result[name] = (mode, kind, oid)
+        return result
+
+    def load_artifacts(self, commit: str) -> dict[str, ArtifactInfo]:
+        root = self.root_entries(commit)
+        artifacts: dict[str, ArtifactInfo] = {}
+        meta_requests: list[tuple[str, str, str]] = []
+        for name, (mode, kind, oid) in root.items():
+            if name == README_NAME:
+                if mode != "100644" or kind != "blob":
+                    raise ArtifactError(f"Unsupported entry: {name}")
+                continue
+            if kind != "tree" or mode != "040000":
+                raise ArtifactError(f"Unexpected artifacts-branch entry: {name}")
+            valid_artifact_name(name)
+            if name in artifacts:
+                raise ArtifactError(f"Duplicate Artifact directory: {name}")
+            meta_oid = None
+            for child_mode, child_kind, child_oid, child_name in self.ls_tree(oid):
+                if child_name == ARTIFACT_META:
+                    if child_mode != "100644" or child_kind != "blob":
+                        raise ArtifactError(f"Unsupported {ARTIFACT_META} entry in {name}")
+                    meta_oid = child_oid
+            if meta_oid is None:
+                raise ArtifactError(f"Missing {ARTIFACT_META} in Artifact {name}")
+            meta_requests.append((name, oid, meta_oid))
+        if not meta_requests:
+            return artifacts
+        payload = b"".join(f"{meta_oid}\n".encode() for _, _, meta_oid in meta_requests)
+        batch = self.git("cat-file", "--batch", data=payload).stdout
+        offset = 0
+        for name, tree_oid, meta_oid in meta_requests:
+            header_end = batch.find(b"\n", offset)
+            if header_end < 0:
+                raise ArtifactError("Unexpected cat-file --batch output.")
+            header = batch[offset:header_end].decode("ascii")
+            offset = header_end + 1
+            parts = header.split()
+            if len(parts) != 3 or parts[0] != meta_oid or parts[1] != "blob":
+                raise ArtifactError(f"Cannot read {ARTIFACT_META} for {name}")
+            size = int(parts[2])
+            data = batch[offset:offset + size]
+            offset += size
+            if offset < len(batch) and batch[offset:offset + 1] == b"\n":
+                offset += 1
+            meta = parse_meta(data, context=name)
+            artifacts[name] = ArtifactInfo(
+                name=name,
+                description=meta["description"],
+                created_at=meta["created_at"],
+                updated_at=meta["updated_at"],
+                tree_oid=tree_oid,
+                meta_oid=meta_oid,
+            )
+        return artifacts
+
+    def artifact_files(self, commit: str, name: str) -> dict[str, tuple[str, str]]:
+        """Return relative path -> (mode, oid), excluding .artifact.json."""
+        files: dict[str, tuple[str, str]] = {}
+        prefix = name + "/"
+        for mode, kind, oid, path in self.ls_tree(commit, recursive=True):
+            if not path.startswith(prefix):
+                continue
+            if kind == "tree":
+                continue
+            if mode not in ("100644", "100755") or kind != "blob":
+                raise ArtifactError(f"Unsupported entry in Artifact {name}: {path}")
+            rel = path[len(prefix):]
+            if rel == ARTIFACT_META:
+                continue
+            valid_relpath(rel)
+            files[rel] = (mode, oid)
+        return files
+
+    def mktree(self, entries: list[tuple[str, str, str, str]]) -> str:
+        # entries: (mode, kind, oid, name)
+        payload = b""
+        for mode, kind, oid, name in sorted(entries, key=lambda item: item[3].encode()):
+            payload += f"{mode} {kind} {oid}".encode() + b"\t" + name.encode() + b"\0"
+        return self.git("mktree", "-z", data=payload).stdout.decode().strip()
+
+    def write_nested_tree(self, nested: dict) -> str:
+        entries = []
+        for name, item in nested.items():
+            if isinstance(item, dict):
+                oid = self.write_nested_tree(item)
+                entries.append(("040000", "tree", oid, name))
+            else:
+                mode, oid = item
+                entries.append((mode, "blob", oid, name))
+        return self.mktree(entries)
+
+    def tree_from_mapping(self, files: dict[str, tuple[str, str]]) -> str:
+        nested: dict = {}
+        for path, (mode, oid) in files.items():
+            node = nested
+            parts = path.split("/")
+            for part in parts[:-1]:
+                child = node.setdefault(part, {})
+                if not isinstance(child, dict):
+                    raise ArtifactError(f"File/directory conflict: {path}")
+                node = child
+            leaf = parts[-1]
+            if isinstance(node.get(leaf), dict):
+                raise ArtifactError(f"File/directory conflict: {path}")
+            node[leaf] = (mode, oid)
+        return self.write_nested_tree(nested)
+
+    def tree_from_local(self, local_dir: Path, meta_bytes: bytes) -> str:
+        files: dict[str, tuple[str, str]] = {ARTIFACT_META: ("100644", self.hash_blob(meta_bytes))}
+        if local_dir.exists():
+            for path in sorted(local_dir.rglob("*")):
+                rel = path.relative_to(local_dir).as_posix()
+                if path.name == ARTIFACT_META:
+                    raise ArtifactError(f"Reserved filename {ARTIFACT_META}: {rel}")
+                if path.is_dir():
+                    if path.is_symlink():
+                        raise ArtifactError(f"Symlinks are not supported: {rel}")
+                    continue
+                if path.is_symlink():
+                    raise ArtifactError(f"Symlinks are not supported: {rel}")
+                if not path.is_file():
+                    raise ArtifactError(f"Unsupported file type: {rel}")
+                valid_relpath(rel)
+                files[rel] = (file_mode(path), self.hash_blob(path.read_bytes()))
+        return self.tree_from_mapping(files)
+
+    def commit_root(
+        self,
+        ref: str,
+        old_oid: str | None,
+        parent: str | None,
+        root_entries: dict[str, tuple[str, str, str]],
+        message: str,
+    ) -> str | None:
+        self.ensure_not_checked_out(ref)
+        tree_entries = [(mode, kind, oid, name) for name, (mode, kind, oid) in root_entries.items()]
+        tree = self.mktree(tree_entries)
+        if parent:
+            old_tree = self.git("rev-parse", parent + "^{tree}").stdout.decode().strip()
+            if tree == old_tree:
+                print("No changes.")
+                return None
+        command = ["commit-tree", tree]
+        if parent:
+            command += ["-p", parent]
+        oid = self.git(*command, data=message.encode("utf-8")).stdout.decode().strip()
+        self.ensure_not_checked_out(ref)
+        expected = old_oid or ("0" * len(oid))
+        result = self.git("update-ref", "--no-deref", "-m", "git-artifact", ref, oid, expected, check=False)
+        if result.returncode:
+            raise ArtifactError(
+                "Cannot update branch: it changed concurrently or its ref name conflicts.", 3,
+            )
+        print(f"{ref.removeprefix('refs/heads/')} {oid[:12]}")
+        return oid
+
+    def write_update(
+        self,
+        ref: str,
+        old_oid: str | None,
+        parent: str | None,
+        updates: dict[str, str | None],
+        message: str,
+        *,
+        init_readme: bool = False,
+    ) -> str | None:
+        if init_readme:
+            root: dict[str, tuple[str, str, str]] = {
+                README_NAME: ("100644", "blob", self.hash_blob(ARTIFACT_README.encode())),
+            }
+        else:
+            assert parent is not None
+            root = self.root_entries(parent)
+            for name in updates:
+                valid_artifact_name(name)
+        for name, tree_oid in updates.items():
+            if tree_oid is None:
+                if name not in root:
+                    raise ArtifactError(f"Artifact does not exist: {name}")
+                del root[name]
+            else:
+                root[name] = ("040000", "tree", tree_oid)
+        return self.commit_root(ref, old_oid, parent, root, message)
+
+
+def message_for(args: argparse.Namespace, names: list[str] | None = None) -> str:
+    if getattr(args, "message", None) is not None:
+        message = "\n\n".join(args.message)
+    elif getattr(args, "message_file", None) is not None:
+        if args.message_file == "-" or not Path(args.message_file).is_file():
+            raise ArtifactError("--message-file requires a regular UTF-8 file, not stdin.", 2)
+        message = Path(args.message_file).read_text(encoding="utf-8")
+    else:
+        operation = args.operation
+        titles = {
+            "init": "Initialize artifacts branch",
+            "new": f"Create Artifact {names[0]}" if names else "Create Artifact",
+            "save": "Save Artifacts",
+            "describe": f"Describe Artifact {names[0]}" if names else "Describe Artifact",
+            "delete": "Delete Artifacts",
+        }
+        message = "git-artifact: " + titles.get(operation, operation.capitalize())
+        if names and operation in ("save", "delete"):
+            message += "\n\n" + "\n".join(names)
+    if not message.strip() or "\0" in message:
+        raise ArtifactError("Commit messages must be nonempty and contain no NUL bytes.", 2)
+    return message
+
+
+def select_names(args: argparse.Namespace, *, allow_all: bool) -> list[str]:
+    names = [valid_artifact_name(name) for name in getattr(args, "names", []) or []]
+    if allow_all and getattr(args, "all", False):
+        if names:
+            raise ArtifactError("specify Artifact names or --all, exclusively", 2)
+        return []
+    if allow_all and not names and not getattr(args, "all", False):
+        raise ArtifactError("specify Artifact names or --all, exclusively", 2)
+    if not allow_all and not names:
+        raise ArtifactError("specify Artifact names", 2)
+    # Preserve order, unique
+    seen = set()
+    ordered = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def remove_directory(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_symlink() or not path.is_dir():
+        raise ArtifactError(f"Not a directory: {path}")
+    shutil.rmtree(path)
+
+
+def write_files_atomically(dest_dir: Path, files: dict[str, tuple[str, bytes]], *, force: bool) -> None:
+    if dest_dir.exists():
+        if not force:
+            raise ArtifactError(
+                f"Local Artifact already exists: {DEFAULT_WORKSPACE}/{dest_dir.name}. Use -f.",
+            )
+        remove_directory(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    pending: list[Path] = []
+    try:
+        for rel, (mode, data) in sorted(files.items()):
+            target = dest_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=".git-artifact-", dir=target.parent)
+            pending.append(Path(temporary))
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+            os.chmod(temporary, 0o755 if mode == "100755" else 0o644)
+            os.replace(temporary, target)
+            pending.pop()
+    finally:
+        for temporary in pending:
+            temporary.unlink(missing_ok=True)
+
+
+def unified_diff_text(name: str, stored: bytes, local: bytes) -> str:
+    try:
+        stored_text = stored.decode("utf-8")
+        local_text = local.decode("utf-8")
+    except UnicodeDecodeError:
+        return f"Binary files a/{name} and b/{name} differ\n"
+    lines = difflib.unified_diff(
+        stored_text.splitlines(keepends=True),
+        local_text.splitlines(keepends=True),
+        fromfile=f"a/{name}",
+        tofile=f"b/{name}",
+    )
+    return "".join(
+        line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+        for line in lines
+    )
+
+
+def file_diff_text(
+    name: str,
+    stored: tuple[str, bytes] | None,
+    local: tuple[str, bytes] | None,
+) -> str:
+    if stored == local:
+        return ""
+    text = f"diff --git a/{name} b/{name}\n"
+    if stored is None:
+        assert local is not None
+        text += f"new file mode {local[0]}\n"
+    elif local is None:
+        text += f"deleted file mode {stored[0]}\n"
+    elif stored[0] != local[0]:
+        text += f"old mode {stored[0]}\nnew mode {local[0]}\n"
+    stored_data = stored[1] if stored is not None else b""
+    local_data = local[1] if local is not None else b""
+    if stored_data != local_data:
+        text += unified_diff_text(name, stored_data, local_data)
+    return text
+
+
+def collect_local_files(local_dir: Path) -> dict[str, tuple[str, bytes]]:
+    files: dict[str, tuple[str, bytes]] = {}
+    if not local_dir.exists():
+        return files
+    for path in sorted(local_dir.rglob("*")):
+        if path.name == ARTIFACT_META:
+            rel = path.relative_to(local_dir).as_posix()
+            raise ArtifactError(f"Reserved filename {ARTIFACT_META}: {rel}")
+        if path.is_dir():
+            if path.is_symlink():
+                raise ArtifactError(f"Symlinks are not supported: {path}")
+            continue
+        if path.is_symlink():
+            raise ArtifactError(f"Symlinks are not supported: {path}")
+        if not path.is_file():
+            raise ArtifactError(f"Unsupported file type: {path}")
+        rel = path.relative_to(local_dir).as_posix()
+        valid_relpath(rel)
+        files[rel] = (file_mode(path), path.read_bytes())
+    return files
+
+
+def cmd_list(repo: Repository, args: argparse.Namespace, artifacts: dict[str, ArtifactInfo]) -> None:
+    items = list(artifacts.values())
+    if args.filter is not None:
+        text = args.filter
+        items = [item for item in items if text in item.name or text in item.description]
+    reverse = args.order == "desc"
+    if args.sort == "name":
+        items.sort(key=lambda item: item.name, reverse=reverse)
+    elif args.sort == "created_at":
+        items.sort(key=lambda item: (parse_utc(item.created_at), item.name), reverse=reverse)
+    elif args.sort == "updated_at":
+        items.sort(key=lambda item: (parse_utc(item.updated_at), item.name), reverse=reverse)
+    else:
+        raise ArtifactError(f"Unsupported --sort field: {args.sort}", 2)
+    if args.json:
+        payload = [
+            {
+                "name": item.name,
+                "description": item.description,
+                "created_at": item.created_at,
+                "updated_at": item.updated_at,
+            }
+            for item in items
+        ]
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return
+    rows = [
+        (
+            item.name,
+            item.description.replace("\n", " "),
+            format_local(parse_utc(item.created_at)),
+            format_local(parse_utc(item.updated_at)),
+        )
+        for item in items
+    ]
+    headers = ("NAME", "DESCRIPTION", "CREATED_AT", "UPDATED_AT")
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    def format_row(cells: tuple[str, str, str, str]) -> str:
+        return (
+            f"{cells[0]:<{widths[0]}}  {cells[1]:<{widths[1]}}  "
+            f"{cells[2]:<{widths[2]}}  {cells[3]}"
+        )
+
+    print(format_row(headers))
+    for row in rows:
+        print(format_row(row))
+
+
+def cmd_new(
+    repo: Repository,
+    args: argparse.Namespace,
+    ref: str,
+    old_oid: str | None,
+    parent: str | None,
+    artifacts: dict[str, ArtifactInfo],
+) -> None:
+    name = valid_artifact_name(args.name)
+    if name in artifacts:
+        raise ArtifactError(f"Artifact already exists: {name}")
+    if repo.workspace.exists() and not repo.workspace.is_dir():
+        raise ArtifactError(f"Not a directory: {DEFAULT_WORKSPACE}")
+    local = repo.local_artifact_dir(name)
+    if local.exists():
+        raise ArtifactError(f"Local Artifact already exists: {DEFAULT_WORKSPACE}/{name}")
+    now = utc_now()
+    description = args.description if args.description is not None else ""
+    meta = dump_meta(description, now, now)
+    tree_oid = repo.tree_from_mapping({ARTIFACT_META: ("100644", repo.hash_blob(meta))})
+    message = message_for(args, [name])
+    repo.write_update(ref, old_oid, parent, {name: tree_oid}, message)
+    repo.ensure_workspace_excluded()
+    local.mkdir(parents=True, exist_ok=False)
+    print(f"Created: {DEFAULT_WORKSPACE}/{name}")
+
+
+def cmd_load(
+    repo: Repository,
+    args: argparse.Namespace,
+    commit: str,
+    artifacts: dict[str, ArtifactInfo],
+) -> None:
+    if args.all:
+        names = sorted(artifacts)
+        if not names:
+            print("No Artifacts.")
+            return
+    else:
+        names = select_names(args, allow_all=True)
+        for name in names:
+            if name not in artifacts:
+                raise ArtifactError(f"Artifact does not exist: {name}")
+    destinations = []
+    for name in names:
+        local = repo.local_artifact_dir(name)
+        if local.exists() and not args.force:
+            raise ArtifactError(f"Local Artifact already exists: {DEFAULT_WORKSPACE}/{name}. Use -f.")
+        destinations.append((name, local))
+    repo.ensure_workspace_excluded()
+    for name, local in destinations:
+        stored = repo.artifact_files(commit, name)
+        files = {
+            rel: (mode, repo.blob(oid))
+            for rel, (mode, oid) in stored.items()
+        }
+        write_files_atomically(local, files, force=args.force)
+        print(f"Loaded: {DEFAULT_WORKSPACE}/{name}")
+
+
+def cmd_save(
+    repo: Repository,
+    args: argparse.Namespace,
+    ref: str,
+    old_oid: str | None,
+    parent: str,
+    artifacts: dict[str, ArtifactInfo],
+) -> None:
+    if args.all:
+        names = repo.list_local_artifacts()
+        if not names:
+            print("No Artifacts.")
+            return
+    else:
+        names = select_names(args, allow_all=True)
+    for name in names:
+        if name not in artifacts:
+            raise ArtifactError(f"Artifact does not exist on the storage branch: {name}. Use new.")
+        local = repo.local_artifact_dir(name)
+        if not local.exists():
+            raise ArtifactError(f"Local Artifact does not exist: {DEFAULT_WORKSPACE}/{name}")
+    updates: dict[str, str | None] = {}
+    now = utc_now()
+    for name in names:
+        info = artifacts[name]
+        meta = dump_meta(info.description, info.created_at, now)
+        local = repo.local_artifact_dir(name)
+        updates[name] = repo.tree_from_local(local, meta)
+    message = message_for(args, names)
+    repo.write_update(ref, old_oid, parent, updates, message)
+
+
+def cmd_describe(
+    repo: Repository,
+    args: argparse.Namespace,
+    ref: str,
+    old_oid: str | None,
+    parent: str,
+    artifacts: dict[str, ArtifactInfo],
+) -> None:
+    name = valid_artifact_name(args.name)
+    if name not in artifacts:
+        raise ArtifactError(f"Artifact does not exist: {name}")
+    if args.clear:
+        description = ""
+    else:
+        if args.text is None:
+            raise ArtifactError("specify description TEXT or --clear", 2)
+        if args.text == "":
+            raise ArtifactError("description TEXT must be nonempty; use --clear to clear it", 2)
+        description = args.text
+    info = artifacts[name]
+    now = utc_now()
+    meta = dump_meta(description, info.created_at, now)
+    files = repo.artifact_files(parent, name)
+    mapping = {rel: (mode, oid) for rel, (mode, oid) in files.items()}
+    mapping[ARTIFACT_META] = ("100644", repo.hash_blob(meta))
+    tree_oid = repo.tree_from_mapping(mapping)
+    message = message_for(args, [name])
+    repo.write_update(ref, old_oid, parent, {name: tree_oid}, message)
+
+
+def cmd_delete(
+    repo: Repository,
+    args: argparse.Namespace,
+    ref: str,
+    old_oid: str | None,
+    parent: str,
+    artifacts: dict[str, ArtifactInfo],
+) -> None:
+    names = select_names(args, allow_all=False)
+    for name in names:
+        if name not in artifacts:
+            raise ArtifactError(f"Artifact does not exist: {name}")
+    updates = {name: None for name in names}
+    message = message_for(args, names)
+    repo.write_update(ref, old_oid, parent, updates, message)
+
+
+def cmd_diff(
+    repo: Repository,
+    args: argparse.Namespace,
+    commit: str,
+    artifacts: dict[str, ArtifactInfo],
+) -> int:
+    if args.all:
+        names = repo.list_local_artifacts()
+        if not names:
+            print("No Artifacts.")
+            return 0
+    else:
+        names = select_names(args, allow_all=True)
+    changed = False
+    for name in names:
+        local = repo.local_artifact_dir(name)
+        if not local.exists():
+            print(f"Absent: {name}")
+            continue
+        local_files = collect_local_files(local)
+        if name not in artifacts:
+            # Local-only: report every file as added.
+            for rel, entry in sorted(local_files.items()):
+                path = f"{name}/{rel}"
+                text = file_diff_text(path, None, entry)
+                if text:
+                    sys.stdout.write(text)
+                    if not text.endswith("\n"):
+                        sys.stdout.write("\n")
+                    changed = True
+            if not local_files:
+                print(f"Local-only empty Artifact: {name}")
+                changed = True
+            continue
+        stored_files = repo.artifact_files(commit, name)
+        stored_map = {rel: (mode, repo.blob(oid)) for rel, (mode, oid) in stored_files.items()}
+        all_rels = sorted(set(stored_map) | set(local_files))
+        for rel in all_rels:
+            path = f"{name}/{rel}"
+            text = file_diff_text(path, stored_map.get(rel), local_files.get(rel))
+            if text:
+                sys.stdout.write(text)
+                if not text.endswith("\n"):
+                    sys.stdout.write("\n")
+                changed = True
+    return 1 if changed else 0
+
+
+def execute(args: argparse.Namespace) -> int | None:
+    if shutil.which("git") is None:
+        raise ArtifactError("Required command not found: git")
+    repo = Repository()
+    update = args.operation in ("init", "new", "save", "describe", "delete")
+    branch = args.branch or DEFAULT_BRANCH
+    ref = repo.branch_ref(branch)
+    old_oid = repo.branch_oid(ref)
+    if update:
+        repo.ensure_not_checked_out(ref)
+
+    if args.operation == "init":
+        if old_oid:
+            raise ArtifactError(f"Branch already exists: {branch}")
+        message = message_for(args)
+        repo.write_update(ref, None, None, {}, message, init_readme=True)
+        return None
+
+    new = getattr(args, "new_branch", False)
+    if new:
+        if old_oid:
+            raise ArtifactError(f"Branch already exists: {branch}")
+        parent = repo.commit_oid(args.base or DEFAULT_BRANCH)
+        expected_old = None
+    else:
+        if not old_oid:
+            raise ArtifactError(
+                f"Branch does not exist: {branch}."
+                + (" Use init or --new-branch." if update else ""),
+            )
+        parent = repo.commit_oid(ref)
+        expected_old = old_oid
+
+    source = parent
+    if args.operation == "load" and args.revision:
+        source = repo.commit_oid(args.revision)
+        tip = repo.commit_oid(ref)
+        if repo.git("merge-base", "--is-ancestor", source, tip, check=False).returncode:
+            raise ArtifactError("Revision is not reachable from the selected branch.")
+
+    artifacts = repo.load_artifacts(source)
+
+    if args.operation == "list":
+        cmd_list(repo, args, artifacts)
+        return None
+    if args.operation == "new":
+        cmd_new(repo, args, ref, expected_old, parent, artifacts)
+        return None
+    if args.operation == "load":
+        cmd_load(repo, args, source, artifacts)
+        return None
+    if args.operation == "save":
+        cmd_save(repo, args, ref, expected_old, parent, artifacts)
+        return None
+    if args.operation == "describe":
+        cmd_describe(repo, args, ref, expected_old, parent, artifacts)
+        return None
+    if args.operation == "delete":
+        cmd_delete(repo, args, ref, expected_old, parent, artifacts)
+        return None
+    if args.operation == "diff":
+        return cmd_diff(repo, args, source, artifacts)
+    raise ArtifactError(f"Unknown operation: {args.operation}")
+
+
+def add_message_options(parser: argparse.ArgumentParser) -> None:
+    messages = parser.add_mutually_exclusive_group()
+    messages.add_argument(
+        "-m", "--message", action="append", metavar="TEXT",
+        help="Commit message; repeat for paragraphs.",
+    )
+    messages.add_argument(
+        "-F", "--message-file", metavar="PATH",
+        help="Read a UTF-8 commit message from a file (not stdin).",
+    )
+
+
+def add_branch_options(
+    parser: argparse.ArgumentParser,
+    *,
+    create: bool,
+    branch_help: str,
+) -> None:
+    parser.add_argument("-b", "--branch", metavar="NAME", help=branch_help)
+    if create:
+        parser.add_argument(
+            "-n", "--new-branch", action="store_true",
+            help="Create the named -b branch; fail if it already exists.",
+        )
+        parser.add_argument(
+            "-B", "--base", metavar="REF",
+            help=f"Creation base (default: {DEFAULT_BRANCH}); requires -n.",
+        )
+
+
+def parser_for_cli() -> argparse.ArgumentParser:
+    requirements = "Requires Python 3.11+ and git."
+    root_epilog = requirements + f"""
+
+Examples:
+  git artifact init
+  git artifact new auth-redesign -d 'Auth redesign notes'
+  git artifact save auth-redesign
+  git artifact load auth-redesign
+  git artifact list --filter auth --sort updated_at --order desc
+  git artifact describe auth-redesign 'Updated summary'
+  git artifact delete old-spike
+  git artifact save -b artifacts-update -n -B origin/{DEFAULT_BRANCH} auth-redesign
+
+Exit codes:
+  0  Success (diff: no differences)
+  1  Runtime error, or diff found differences
+  2  Usage error
+  3  Concurrent branch update rejected
+"""
+    parser = argparse.ArgumentParser(
+        prog="git artifact",
+        description=__doc__,
+        epilog=root_epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    commands.add_parser(
+        "version", help="Show the version.", description="Print the version and exit.",
+        allow_abbrev=False,
+    )
+
+    skill = commands.add_parser(
+        "skill",
+        help="Print or install the git-artifact agent skill.",
+        description="Print SKILL.md to stdout, or write it to a file.",
+        epilog=(
+            "Examples:\n  git artifact skill\n  git artifact skill -o\n"
+            "  git artifact skill -o .claude/skills/git-artifact/SKILL.md\n"
+            "Relative output paths are resolved from the current directory; parent directories are created."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        allow_abbrev=False,
+    )
+    skill.add_argument(
+        "-o", "--output", nargs="?", const=DEFAULT_SKILL_PATH, metavar="PATH",
+        help=f"Write SKILL.md to a file (default when PATH is omitted: {DEFAULT_SKILL_PATH}).",
+    )
+    skill.add_argument("-f", "--force", action="store_true", help="Overwrite an existing output file; requires -o.")
+
+    init = commands.add_parser(
+        "init", help="Initialize an independent artifacts branch.",
+        description="Create an orphan artifacts branch with a management README.",
+        epilog=requirements, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
+    )
+    init.set_defaults(operation="init")
+    add_branch_options(init, create=False, branch_help=f"Local branch to create (default: {DEFAULT_BRANCH}).")
+    add_message_options(init)
+
+    listed = commands.add_parser(
+        "list", help="List Artifacts on the storage branch.",
+        description="List Artifacts with optional filter and sorting.",
+        epilog=requirements, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
+    )
+    listed.set_defaults(operation="list")
+    add_branch_options(listed, create=False, branch_help=f"Local branch to read (default: {DEFAULT_BRANCH}).")
+    listed.add_argument(
+        "--sort", metavar="FIELD", default="name",
+        choices=("name", "created_at", "updated_at"),
+        help="Sort key: name, created_at, or updated_at (default: name).",
+    )
+    listed.add_argument(
+        "--order", metavar="ORDER", default="asc", choices=("asc", "desc"),
+        help="Sort order: asc or desc (default: asc).",
+    )
+    listed.add_argument(
+        "--filter", metavar="TEXT",
+        help="Keep Artifacts whose Name or Description contains TEXT (case-sensitive substring).",
+    )
+    listed.add_argument("--json", action="store_true", help="Print JSON.")
+
+    new = commands.add_parser(
+        "new", help="Create a new Artifact on the storage branch.",
+        description="Create Artifact metadata on the storage branch and an empty local directory.",
+        epilog=requirements, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
+    )
+    new.set_defaults(operation="new")
+    add_branch_options(new, create=True, branch_help=f"Local branch to update (default: {DEFAULT_BRANCH}).")
+    add_message_options(new)
+    new.add_argument("-d", "--description", metavar="TEXT", help="Initial description (default: empty).")
+    new.add_argument("name", metavar="NAME", help="Artifact name.")
+
+    load = commands.add_parser(
+        "load", help="Load saved Artifacts into the local workspace.",
+        description="Expand Artifact Files into .artifacts/ without .artifact.json.",
+        epilog=requirements, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
+    )
+    load.set_defaults(operation="load")
+    add_branch_options(load, create=False, branch_help=f"Local branch to read (default: {DEFAULT_BRANCH}).")
+    load.add_argument("-a", "--all", action="store_true", help="Load every Artifact on the branch.")
+    load.add_argument("-f", "--force", action="store_true", help="Overwrite existing local Artifact directories.")
+    load.add_argument(
+        "--revision", metavar="REV",
+        help="Load from a commit reachable from the selected branch tip (default: tip).",
+    )
+    load.add_argument("names", nargs="*", metavar="NAME", help="Artifact names.")
+
+    save = commands.add_parser(
+        "save", help="Save local Artifact Files to the storage branch.",
+        description="Replace existing Artifacts with local workspace snapshots.",
+        epilog=requirements, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
+    )
+    save.set_defaults(operation="save")
+    add_branch_options(save, create=True, branch_help=f"Local branch to update (default: {DEFAULT_BRANCH}).")
+    add_message_options(save)
+    save.add_argument(
+        "-a", "--all", action="store_true",
+        help="Save every Artifact present in the local workspace.",
+    )
+    save.add_argument("names", nargs="*", metavar="NAME", help="Artifact names.")
+
+    describe = commands.add_parser(
+        "describe", help="Set or clear an Artifact description.",
+        description="Update description on the storage branch without changing Files.",
+        epilog=requirements, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
+    )
+    describe.set_defaults(operation="describe")
+    add_branch_options(describe, create=True, branch_help=f"Local branch to update (default: {DEFAULT_BRANCH}).")
+    add_message_options(describe)
+    describe.add_argument("--clear", action="store_true", help="Set description to an empty string.")
+    describe.add_argument("name", metavar="NAME", help="Artifact name.")
+    describe.add_argument("text", nargs="?", metavar="TEXT", help="New description text.")
+
+    delete = commands.add_parser(
+        "delete", help="Delete Artifacts from the storage branch.",
+        description="Remove Artifact directories from the storage branch tip; local workspace is unchanged.",
+        epilog=requirements, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
+    )
+    delete.set_defaults(operation="delete")
+    add_branch_options(delete, create=True, branch_help=f"Local branch to update (default: {DEFAULT_BRANCH}).")
+    add_message_options(delete)
+    delete.add_argument("names", nargs="+", metavar="NAME", help="Artifact names.")
+
+    diff = commands.add_parser(
+        "diff", help="Compare local Artifacts to the storage branch.",
+        description=(
+            "Print unified diffs (a/=storage, b/=local). Exit 1 when any selected Artifact differs. "
+            "Absent local Artifacts are reported."
+        ),
+        epilog=requirements, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
+    )
+    diff.set_defaults(operation="diff")
+    add_branch_options(diff, create=False, branch_help=f"Local branch to compare (default: {DEFAULT_BRANCH}).")
+    diff.add_argument(
+        "-a", "--all", action="store_true",
+        help="Diff every Artifact present in the local workspace.",
+    )
+    diff.add_argument("names", nargs="*", metavar="NAME", help="Artifact names.")
+
+    return parser
+
+
+def main() -> int:
+    if sys.version_info < (3, 11):
+        print("git-artifact: Python 3.11 or later is required.", file=sys.stderr)
+        return 1
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupt)
+    parser = parser_for_cli()
+    if len(sys.argv) == 1:
+        parser.print_help()
+        return 0
+    args = parser.parse_args()
+    if args.command == "version":
+        print(VERSION)
+        return 0
+    if getattr(args, "new_branch", False) and args.branch is None:
+        parser.error("--new-branch requires an explicit --branch")
+    if getattr(args, "base", None) is not None and not getattr(args, "new_branch", False):
+        parser.error("--base requires --new-branch")
+    if args.command == "describe":
+        if args.clear and args.text is not None:
+            parser.error("specify description TEXT or --clear, exclusively")
+        if not args.clear and args.text is None:
+            parser.error("specify description TEXT or --clear")
+    if args.command in ("load", "save", "diff"):
+        has_names = bool(getattr(args, "names", None))
+        has_all = bool(getattr(args, "all", False))
+        if has_names == has_all:
+            parser.error("specify Artifact names or --all, exclusively")
+    try:
+        if args.command == "skill":
+            output_skill(args)
+            return 0
+        code = execute(args)
+        return 0 if code is None else code
+    except ArtifactError as error:
+        print(f"git-artifact: {error}", file=sys.stderr)
+        return error.code
+    except (OSError, UnicodeError) as error:
+        print(f"git-artifact: {error}", file=sys.stderr)
+        return 1
+    except (KeyboardInterrupt, EOFError):
+        print("git-artifact: Interrupted.", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
