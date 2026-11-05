@@ -170,7 +170,7 @@ Create a local orphan artifacts branch (default name `artifacts`) with a root `R
 git artifact list [options]
 ```
 
-List Artifacts on the selected branch. Human output is a headered table of `name`, `description`, `created_at`, and `updated_at` (timestamps in the local timezone). `--json` prints the same fields (timestamps in UTC with `Z`). Local workspace contents do not affect the list.
+List Artifacts on the selected branch. Human output is one vertical record per Artifact (`name`, then `Created At` / `Updated At` in the local timezone, then the description when non-empty). Description newlines are preserved. The name is colored like `git log`'s commit header when color is enabled (`color.ui` / TTY; disabled by `NO_COLOR`). `--json` prints the same fields (timestamps in UTC with `Z`) and is never colored. Local workspace contents do not affect the list.
 
 | Option | Purpose |
 | --- | --- |

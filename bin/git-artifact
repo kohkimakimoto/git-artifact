@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 DEFAULT_BRANCH = "artifacts"
 DEFAULT_WORKSPACE = ".artifacts"
@@ -169,6 +169,23 @@ def parse_utc(value: str) -> datetime:
 def format_local(dt: datetime) -> str:
     local = dt.astimezone()
     return local.strftime("%Y-%m-%d %H:%M:%S %z")
+
+
+def stdout_wants_color() -> bool:
+    if os.environ.get("NO_COLOR", "") != "":
+        return False
+    tty = "true" if sys.stdout.isatty() else "false"
+    result = run(["git", "config", "--get-colorbool", "color.ui", tty], check=False)
+    if result.returncode == 0:
+        return result.stdout.decode("utf-8", "replace").strip() == "true"
+    return sys.stdout.isatty()
+
+
+def colorize(text: str, *, enabled: bool) -> str:
+    # Same yellow as git log's commit header (color.diff.commit default).
+    if not enabled:
+        return text
+    return f"\033[33m{text}\033[m"
 
 
 def valid_artifact_name(name: str) -> str:
@@ -760,30 +777,21 @@ def cmd_list(repo: Repository, args: argparse.Namespace, artifacts: dict[str, Ar
         json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
         return
-    rows = [
-        (
-            item.name,
-            item.description.replace("\n", " "),
-            format_local(parse_utc(item.created_at)),
-            format_local(parse_utc(item.updated_at)),
-        )
-        for item in items
-    ]
-    headers = ("NAME", "DESCRIPTION", "CREATED_AT", "UPDATED_AT")
-    widths = [len(header) for header in headers]
-    for row in rows:
-        for index, cell in enumerate(row):
-            widths[index] = max(widths[index], len(cell))
-
-    def format_row(cells: tuple[str, str, str, str]) -> str:
-        return (
-            f"{cells[0]:<{widths[0]}}  {cells[1]:<{widths[1]}}  "
-            f"{cells[2]:<{widths[2]}}  {cells[3]}"
-        )
-
-    print(format_row(headers))
-    for row in rows:
-        print(format_row(row))
+    color = stdout_wants_color()
+    blocks: list[str] = []
+    for item in items:
+        lines = [
+            colorize(item.name, enabled=color),
+            f"Created At:  {format_local(parse_utc(item.created_at))}",
+            f"Updated At:  {format_local(parse_utc(item.updated_at))}",
+        ]
+        if item.description:
+            lines.append("")
+            lines.append(item.description.rstrip("\n"))
+        blocks.append("\n".join(lines))
+    if blocks:
+        sys.stdout.write("\n\n".join(blocks))
+        sys.stdout.write("\n")
 
 
 def cmd_new(
