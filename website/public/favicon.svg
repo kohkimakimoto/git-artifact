@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="192" height="192" viewBox="0 0 192 192" fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">git-artifact — two roots</title>
+  <desc id="desc">Two disconnected horizontal histories: navy application commits above and a teal artifacts root leading to a document below.</desc>
+  <path d="M43 53h106" stroke="#33465E" stroke-width="9" stroke-linecap="round"/>
+  <g fill="#33465E">
+    <circle cx="43" cy="53" r="13"/>
+    <circle cx="96" cy="53" r="13"/>
+    <circle cx="149" cy="53" r="13"/>
+  </g>
+  <path d="M43 134h80" stroke="#2A9D8F" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="43" cy="134" r="13" fill="#2A9D8F"/>
+  <path fill="#2A9D8F" d="M118 110h28l16 16v38a7 7 0 0 1-7 7h-30a7 7 0 0 1-7-7v-47a7 7 0 0 1 7-7z"/>
+  <path fill="#1F7569" d="M146 110l16 16h-16z"/>
+  <path fill="none" stroke="#FFF" stroke-width="4" stroke-linecap="round" d="M128 140h26M128 150h26M128 160h16"/>
+</svg>
