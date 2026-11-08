@@ -1,0 +1,70 @@
+---
+import ThemeToggle from './ThemeToggle';
+import MobileNav from './MobileNav';
+import DocsSearch from './DocsSearch';
+import LanguagePicker from './LanguagePicker.astro';
+import type { Locale, LanguageAlternate } from '../i18n/config';
+import { getMessages, localizedPath } from '../i18n/utils';
+
+interface Props { locale: Locale; alternates: LanguageAlternate[] }
+const { locale, alternates } = Astro.props;
+const messages = getMessages(locale);
+
+const links = [
+  { href: localizedPath(locale, '/docs/guide/introduction'), label: messages.common.docs },
+
+
+  { href: 'https://github.com/kohkimakimoto/git-artifact', label: 'GitHub' },
+];
+---
+
+<header class="sticky top-0 z-50 border-b border-[var(--border)] bg-[color-mix(in_oklab,var(--bg)_88%,transparent)] backdrop-blur-md">
+  <div class="mx-auto flex h-14 max-w-6xl items-center justify-between gap-4 px-4 sm:px-6">
+    <a href={localizedPath(locale)} class="group flex shrink-0 items-center gap-2.5 text-lg font-medium text-[var(--fg)]">
+      <img src="/logo.svg" alt="" width="28" height="28" class="h-7 w-7 dark:brightness-125" />
+      <span>git-artifact</span>
+    </a>
+
+    <div class="flex items-center gap-2">
+      <nav class="hidden items-center gap-1 md:flex" aria-label={messages.common.primary}>
+        {links.map((link) => (
+          <a
+            href={link.href}
+            class="rounded-md px-3 py-1.5 text-sm text-[var(--fg-muted)] transition hover:bg-[var(--accent-soft)] hover:text-[var(--fg)]"
+            target={link.href.startsWith('http') ? '_blank' : undefined}
+            rel={link.href.startsWith('http') ? 'noopener noreferrer' : undefined}
+          >
+            {link.label}
+          </a>
+        ))}
+      </nav>
+      <button
+        type="button"
+        class="inline-flex h-9 items-center gap-2 rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] px-2.5 text-sm text-[var(--fg-muted)] transition hover:border-[var(--navy)] hover:text-[var(--fg)]"
+        aria-label={messages.docs.searchOpen}
+        data-docs-search-open
+      >
+        <svg viewBox="0 0 24 24" class="h-4 w-4 shrink-0" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle>
+          <path d="M20 20l-3.5-3.5"></path>
+        </svg>
+        <span class="hidden sm:inline">{messages.docs.search}</span>
+        <kbd class="pointer-events-none hidden min-w-[2.75rem] justify-center rounded border border-[var(--border)] px-1.5 py-0.5 text-center font-mono text-[10px] text-[var(--fg-muted)] md:inline-flex" data-docs-search-shortcut>⌘K</kbd>
+      </button>
+      <DocsSearch client:load locale={locale} messages={messages.docs} />
+      <LanguagePicker locale={locale} alternates={alternates} />
+      <ThemeToggle client:load messages={messages.common} />
+      <MobileNav client:load links={links} messages={messages.common} />
+    </div>
+  </div>
+</header>
+<script is:inline>
+  (function () {
+    try {
+      var mac = /Mac|iPhone|iPad|iPod/.test(navigator.userAgent);
+      document.querySelectorAll('[data-docs-search-shortcut]').forEach(function (el) {
+        el.textContent = mac ? '⌘K' : 'Ctrl K';
+      });
+    } catch (_) {}
+  })();
+</script>
