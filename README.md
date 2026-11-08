@@ -6,6 +6,8 @@
 
 <p align="center">Manage development artifacts on a dedicated orphan Git branch, separate from your application code.</p>
 
+<p align="center"><a href="https://git-artifact.kohkimakimoto.dev">https://git-artifact.kohkimakimoto.dev</a></p>
+
 AI-assisted development creates many working materials—notes, plans, prompt logs, analysis reports, and more. Saving them on the same branch as source code risks maintenance issues, such as docs drifting from the implementation. Deleting them makes past decisions hard to recover.
 
 `git artifact` stores these materials as **Artifacts** on an orphan `artifacts` branch. You load only what you need into a local `.artifacts/` workspace, edit ordinary files, and save snapshots back through Git history—without checking out the storage branch or touching your source branch index.
